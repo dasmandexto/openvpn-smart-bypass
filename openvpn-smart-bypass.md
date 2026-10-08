@@ -161,3 +161,143 @@ up /etc/openvpn/up.sh
 # Запуск в фоновом режиме (потребуются права root/sudo)
 sudo openvpn --config client1.ovpn --daemon
 ```
+
+---
+
+## Продвинутая версия: Динамический ipset + Самообучающийся кэш (Smart Learner)
+
+Если заблокированные сайты часто меняют IP-адреса (используют CDN), статический словарь будет за ними не успевать. В этой схеме мы используем динамический словарь (`ipset`) и "умного" демона, который анализирует ответы и сохраняет в постоянный кэш только самые стабильные адреса.
+
+### 1. Переводим Сервер в режим DNS-резолвера
+На сервере больше не нужен Nginx. Установим `dnsmasq`, чтобы сервер отвечал на запросы из туннеля:
+```bash
+apt-get update && apt-get install -y dnsmasq
+cat << 'EOF' > /etc/dnsmasq.conf
+interface=tun0
+bind-interfaces
+server=8.8.8.8
+server=1.1.1.1
+EOF
+systemctl restart dnsmasq
+```
+
+### 2. Клиент: Настройка dnsmasq и ipset
+Устанавливаем `ipset` и обновляем конфигурацию:
+```bash
+apt-get update && apt-get install -y ipset iptables
+
+cat << 'EOF' > /etc/dnsmasq.conf
+no-resolv
+server=8.8.8.8 # Обычный интернет
+
+# Запросы для обхода отправляем на VPN-сервер
+server=/twitter.com/10.8.0.1
+server=/api.twitter.com/10.8.0.1
+server=/instagram.com/10.8.0.1
+
+# Записываем полученные IP во временную память (ipset)
+ipset=/twitter.com/api.twitter.com/instagram.com/vpn_ips
+
+# Настройки для самообучения
+log-queries
+log-facility=/var/log/dnsmasq.log
+addn-hosts=/etc/vpn-static-dictionary.txt
+EOF
+
+touch /etc/vpn-static-dictionary.txt
+touch /var/log/dnsmasq.log
+systemctl restart dnsmasq
+```
+
+### 3. Клиент: Демон Самообучения (Smart Learner)
+Скрипт анализирует логи. Если IP-адрес выдается 3 раза, причем между каждым разом проходит минимум 20 минут, адрес признается "стабильным" и сохраняется на диск.
+
+Создайте файл `/usr/local/bin/vpn-learner.sh`:
+```bash
+cat << 'EOF' > /usr/local/bin/vpn-learner.sh
+#!/bin/bash
+LOG="/var/log/dnsmasq.log"
+DICT="/etc/vpn-static-dictionary.txt"
+IPSET_SAVE="/etc/vpn_ips.save"
+
+tail -F $LOG | awk -v dict="$DICT" -v save="$IPSET_SAVE" '
+BEGIN {
+    while ((getline line < dict) > 0) {
+        split(line, a, " ");
+        if (a[1] != "") known[a[2] "-" a[1]] = 1;
+    }
+    close(dict)
+}
+/reply/ && /is/ {
+    domain = ""
+    ip = ""
+    for (i=1; i<=NF; i++) {
+        if ($i == "reply" && $(i+2) == "is") {
+            domain = $(i+1)
+            ip = $(i+3)
+            break
+        }
+    }
+    if (domain != "" && ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+        key = domain "-" ip
+        if (!known[key]) {
+            now = systime()
+            if (count[key] == 0) {
+                count[key] = 1
+                last_seen[key] = now
+            } else if (now - last_seen[key] >= 1200) {
+                count[key]++
+                last_seen[key] = now
+                if (count[key] == 3) {
+                    known[key] = 1
+                    print ip " " domain >> dict
+                    system("ipset save vpn_ips > " save)
+                    system("systemctl reload dnsmasq")
+                }
+            }
+        }
+    }
+}'
+EOF
+chmod +x /usr/local/bin/vpn-learner.sh
+```
+
+Создайте службу `/etc/systemd/system/vpn-learner.service`:
+```bash
+cat << 'EOF' > /etc/systemd/system/vpn-learner.service
+[Unit]
+Description=Smart VPN DNS Learner
+After=dnsmasq.service
+
+[Service]
+ExecStart=/usr/local/bin/vpn-learner.sh
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload && systemctl enable --now vpn-learner
+```
+
+### 4. Клиент: Обновление up.sh
+Обновите `/etc/openvpn/up.sh` для восстановления сохраненных маршрутов:
+```bash
+cat << 'EOF' > /etc/openvpn/up.sh
+#!/bin/bash
+if [ -f /etc/vpn_ips.save ]; then
+    ipset restore < /etc/vpn_ips.save
+else
+    ipset create vpn_ips hash:ip 2>/dev/null
+fi
+
+iptables -t mangle -C OUTPUT -m set --match-set vpn_ips dst -j MARK --set-mark 1 2>/dev/null || \
+iptables -t mangle -A OUTPUT -m set --match-set vpn_ips dst -j MARK --set-mark 1
+
+ip rule del fwmark 1 table 100 2>/dev/null
+ip rule add fwmark 1 table 100
+ip route replace default dev $1 table 100
+
+systemctl restart dnsmasq
+EOF
+```
